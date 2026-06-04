@@ -1,0 +1,119 @@
+name: Build, Push to ECR and Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: us-east-1
+      AWS_ACCOUNT_ID: "443407534093"
+      ECR_REPOSITORY: springboot
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build JAR
+        run: mvn clean package
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::443407534093:role/GitHubActionsECRPushRole
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set Variables
+        run: |
+          echo "IMAGE_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${GITHUB_SHA}" >> $GITHUB_ENV
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:${IMAGE_NAME}-${IMAGE_TAG} \
+            -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:${IMAGE_NAME}-latest .
+           
+      - name: Verify GitHub Token
+        env:
+          GITOPS_TOKEN: 
+        run: |
+          curl -s \
+            -H "Authorization: token $GITOPS_TOKEN" \
+            https://api.github.com/user
+            
+      - name: Push Docker Images
+        run: |
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:${IMAGE_NAME}-${IMAGE_TAG}
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:${IMAGE_NAME}-latest
+
+      - name: Clone GitOps Repository
+        run: |
+          git clone https://x-access-token:@github.com/rajudruva2/eks-gitops-config.git
+      - name: Verify Git Remote
+        run: |
+            cd eks-gitops-config
+            git remote -v 
+      - name: Create GitOps Application Folder
+        run: |
+          mkdir -p eks-gitops-config/apps/${IMAGE_NAME}
+          cp -r k8s/* eks-gitops-config/apps/${IMAGE_NAME}/
+
+      - name: Update Deployment Image
+        run: |
+          sed -i "s|IMAGE_PLACEHOLDER|$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:${IMAGE_NAME}-latest|g" \
+          eks-gitops-config/apps/${IMAGE_NAME}/deployment.yaml
+
+      
+      - name: Check Secret Exists
+        run: |
+           if [ -z "" ]; then
+              echo "SECRET NOT FOUND"
+              exit 1
+           else
+            echo "SECRET FOUND"
+           fi
+      
+      - name: Commit and Push GitOps Changes
+        env:
+          GITOPS_TOKEN: 
+        run: |
+          cd eks-gitops-config
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add .
+
+          git commit -m "Deploy ${IMAGE_NAME}" || echo "No changes"
+
+          if [ -z "$GITOPS_TOKEN" ]; then
+            echo "GITOPS_TOKEN EMPTY INSIDE PUSH STEP"
+            exit 1
+          else
+            echo "GITOPS_TOKEN AVAILABLE INSIDE PUSH STEP"
+          fi
+
+          git remote set-url origin https://x-access-token:$GITOPS_TOKEN@github.com/rajudruva2/eks-gitops-config.git
+
+          echo "=== REMOTE CONFIGURED ==="
+          git remote -v
+
+          git push origin HEAD:main
